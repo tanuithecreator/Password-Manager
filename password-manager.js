@@ -12,7 +12,7 @@ class Keychain {
   constructor() {
     this.data = {};  // Store public information here (non-sensitive)
     this.secrets = {}; // Store private information here (sensitive keys)
-  };
+  }
 
   /**
    * Initializes an empty keychain with the provided password.
@@ -35,19 +35,21 @@ class Keychain {
         hash: "SHA-256"
       },
       baseKey,
-      { name: "HMAC", hash: "SHA-256", length: 256 },
-      false,
-      ["sign"]
-    );
-
-    // Create HMAC and AES-GCM keys from master key
-    keychain.secrets.hmacKey = masterKey;
-    keychain.secrets.aesKey = await subtle.importKey(
-      "raw",
-      getRandomBytes(32), // Random bytes for AES-GCM key
-      "AES-GCM",
+      { name: "AES-GCM", length: 256 },
       false,
       ["encrypt", "decrypt"]
+    );
+
+    // Use the derived masterKey for AES-GCM
+    keychain.secrets.aesKey = masterKey;
+
+    // Generate a separate key for HMAC directly with the password
+    keychain.secrets.hmacKey = await subtle.importKey(
+      "raw",
+      passwordBuffer,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
     );
 
     // Store salt in public data for key derivation during load
@@ -64,9 +66,14 @@ class Keychain {
     const parsedData = JSON.parse(repr);
     const salt = decodeBuffer(parsedData.salt);
 
-    // Re-derive master key for HMAC and AES-GCM using PBKDF2
+    // Ensure kvs is loaded into data
+    const kvsData = parsedData.kvs;
+
+    // Re-derive the base key from the provided password
     const passwordBuffer = stringToBuffer(password);
     const baseKey = await subtle.importKey("raw", passwordBuffer, "PBKDF2", false, ["deriveKey"]);
+
+    // Derive the AES-GCM master key with PBKDF2
     const masterKey = await subtle.deriveKey(
       {
         name: "PBKDF2",
@@ -75,7 +82,19 @@ class Keychain {
         hash: "SHA-256"
       },
       baseKey,
-      { name: "HMAC", hash: "SHA-256", length: 256 },
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
+
+    // Use the derived masterKey for AES-GCM
+    const aesKey = masterKey;
+
+    // Import the HMAC key with the password directly
+    const hmacKey = await subtle.importKey(
+      "raw",
+      passwordBuffer,
+      { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"]
     );
@@ -89,15 +108,10 @@ class Keychain {
     }
 
     let keychain = new Keychain();
-    keychain.data = parsedData;
-    keychain.secrets.hmacKey = masterKey;
-    keychain.secrets.aesKey = await subtle.importKey(
-      "raw",
-      getRandomBytes(32),
-      "AES-GCM",
-      false,
-      ["encrypt", "decrypt"]
-    );
+    keychain.data = kvsData;  // Correctly assign kvs to data
+    keychain.data.salt = parsedData.salt;
+    keychain.secrets.hmacKey = hmacKey;
+    keychain.secrets.aesKey = aesKey;
 
     return keychain;
   }
@@ -106,7 +120,10 @@ class Keychain {
    * Serializes the keychain contents and computes a SHA-256 hash for integrity.
    */
   async dump() {
-    const jsonData = JSON.stringify(this.data);
+    // Separate kvs data from salt
+    const kvsOnly = Object.assign({}, this.data);
+    delete kvsOnly.salt;  // Ensure salt is stored separately
+    const jsonData = JSON.stringify({ kvs: kvsOnly, salt: this.data.salt });
     const hashBuffer = await subtle.digest("SHA-256", stringToBuffer(jsonData));
     return [jsonData, bufferToString(hashBuffer)];
   }
